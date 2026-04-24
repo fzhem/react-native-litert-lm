@@ -124,6 +124,8 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
 
     // Configuration
     private var backend: Backend = Backend.CPU
+    private var visionBackend: Backend? = null
+    private var audioBackend: Backend? = null
     private var temperature: Double = 0.7
     private var topK: Int = 40
     private var topP: Double = 0.95
@@ -153,6 +155,8 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                 // Apply configuration
                 config?.let { cfg ->
                     cfg.backend?.let { backend = it }
+                    cfg.visionBackend.let {visionBackend = it}
+                    cfg.audioBackend.let {audioBackend = it}
                     cfg.temperature?.let { temperature = it }
                     cfg.topK?.let { topK = it.toInt() }
                     cfg.topP?.let { topP = it }
@@ -171,13 +175,19 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                         else -> com.google.ai.edge.litertlm.Backend.CPU()
                     }
                     
-                    // Vision backend: hardcoded to GPU (required by Gemma models)
-                    val lmVisionBackend = com.google.ai.edge.litertlm.Backend.GPU()
-                        
-                    // Audio backend: hardcoded to CPU (optimal for audio processing)
-                    val lmAudioBackend = com.google.ai.edge.litertlm.Backend.CPU()
+                    val lmVisionBackend = when (visionBackend) {
+                        Backend.GPU -> com.google.ai.edge.litertlm.Backend.GPU()
+                        Backend.CPU -> com.google.ai.edge.litertlm.Backend.CPU()
+                        else -> null
+                    }
+
+                    val lmAudioBackend= when (audioBackend) {
+                        Backend.GPU -> com.google.ai.edge.litertlm.Backend.GPU()
+                        Backend.CPU -> com.google.ai.edge.litertlm.Backend.CPU()
+                        else -> null
+                    }
     
-                    Log.i(TAG, "Backend config: main=$lmBackend, vision=$lmVisionBackend (hardcoded), audio=$lmAudioBackend (hardcoded)")
+                    Log.i(TAG, "Backend config: main=$lmBackend, vision=$lmVisionBackend, audio=$lmAudioBackend")
     
                     // Get cache directory from application context
                     val cacheDirectory = LiteRTLMInitProvider.applicationContext?.cacheDir?.absolutePath

@@ -73,6 +73,8 @@ export function useModel(
   const enableMemoryTracking = config?.enableMemoryTracking ?? false;
   const maxMemorySnapshots = config?.maxMemorySnapshots ?? 256;
   const backend = config?.backend;
+  const visionBackend = config?.visionBackend;
+  const audioBackend = config?.audioBackend;
   const systemPrompt = config?.systemPrompt;
   const maxTokens = config?.maxTokens;
   const temperature = config?.temperature;
@@ -83,13 +85,15 @@ export function useModel(
   const nativeConfig = useMemo<LLMConfig>(
     () => ({
       ...(backend !== undefined && { backend }),
+      ...(visionBackend !== undefined && { visionBackend }),
+      ...(audioBackend !== undefined && { audioBackend }),
       ...(systemPrompt !== undefined && { systemPrompt }),
       ...(maxTokens !== undefined && { maxTokens }),
       ...(temperature !== undefined && { temperature }),
       ...(topK !== undefined && { topK }),
       ...(topP !== undefined && { topP }),
     }),
-    [backend, systemPrompt, maxTokens, temperature, topK, topP],
+    [backend, visionBackend, audioBackend, systemPrompt, maxTokens, temperature, topK, topP],
   );
 
   /**

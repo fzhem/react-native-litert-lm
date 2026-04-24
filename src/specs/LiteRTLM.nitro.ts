@@ -37,13 +37,27 @@ export interface LLMConfig {
    * If not specified, defaults to 'cpu'.
    * If specified backend is unavailable, falls back automatically.
    *
-   * @remarks
-   * Vision encoder is always set to GPU (required by Gemma models).
-   * Audio encoder is always set to CPU (optimal for audio processing).
-   *
    * @default 'cpu'
    */
   backend?: Backend;
+
+  /**
+   * Compute backend for vision/multimodal encoder.
+   * - 'cpu': CPU inference (slower, more compatible)
+   * - 'gpu': GPU acceleration (recommended, required by Gemma models)
+   *
+   * @default null
+   */
+  visionBackend?: Backend | null;
+
+  /**
+   * Compute backend for audio encoder.
+   * - 'cpu': CPU inference (optimal for audio processing)
+   * - 'gpu': GPU acceleration
+   *
+   * @default null
+   */
+  audioBackend?: Backend | null;
 
   /**
    * Maximum number of tokens to generate.
