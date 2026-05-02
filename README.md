@@ -19,7 +19,7 @@ High-performance on-device LLM inference for React Native, powered by [LiteRT-LM
 
 > Gemma 4 E2B running on-device on a Samsung Galaxy S22 (Snapdragon 8 Gen 1, 4 GB RAM) — CPU backend, streaming inference.
 
-<video src="https://github.com/user-attachments/assets/1da527ce-0432-4f8b-8899-474f81b2feea" width="300" controls />
+<video src="https://github.com/user-attachments/assets/1da527ce-0432-4f8b-8899-474f81b2feea" width="300" controls></video>
 
 ## Installation
 
