@@ -1,4 +1,10 @@
-import React, { useState, useCallback, useMemo, useRef } from "react";
+import React, {
+  useState,
+  useCallback,
+  useRef,
+  useEffect,
+  useMemo,
+} from "react";
 import {
   StyleSheet,
   Text,
@@ -9,7 +15,10 @@ import {
   ActivityIndicator,
   TextInput,
   Image,
-  Switch,
+  Animated,
+  Easing,
+  KeyboardAvoidingView,
+  Dimensions,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import {
@@ -18,80 +27,63 @@ import {
   GEMMA_4_E2B_IT,
   checkMultimodalSupport,
   checkBackendSupport,
-  applyGemmaTemplate,
-  createMemoryTracker,
-  type ChatMessage,
+  type MemoryUsage,
 } from "react-native-litert-lm";
 
-// Test asset paths — resolved at runtime from bundled assets
-// On iOS, Metro bundles images into the app; resolveAssetSource gives us a URI.
-// On Android, the file must be pre-pushed to the device.
+// ─── Asset helpers ───────────────────────────────────────────────────────────
 const TEST_IMAGE_ASSET = require("./test.jpeg");
 
-async function getTestImagePath(modelInstance?: any): Promise<string> {
-  if (Platform.OS === "android") {
-    return "/data/local/tmp/test.jpeg";
-  }
-  // iOS: resolveAssetSource returns a file:// URI for local assets in prod,
-  // but an HTTP URL in dev mode (Metro-served)
-  const source = Image.resolveAssetSource(TEST_IMAGE_ASSET);
-  if (source.uri.startsWith("file://")) {
-    return source.uri.replace("file://", "");
-  }
-  // Dev mode: Metro serves via HTTP — use the model's download helper
-  // to fetch it to a local cache file
-  if (modelInstance?.downloadModel) {
-    return await modelInstance.downloadModel(source.uri, "test_image.jpeg");
-  }
-  throw new Error(
-    "Cannot resolve test image path in dev mode without model instance",
-  );
+async function getTestImagePath(inst?: any): Promise<string> {
+  if (Platform.OS === "android") return "/data/local/tmp/test.jpeg";
+  const src = Image.resolveAssetSource(TEST_IMAGE_ASSET);
+  if (src.uri.startsWith("file://")) return src.uri.replace("file://", "");
+  if (inst?.downloadModel)
+    return inst.downloadModel(src.uri, "test_image.jpeg");
+  throw new Error("Cannot resolve test image in dev mode");
 }
 
-const TEST_AUDIO_ASSET = require("./test.wav");
-
-async function getTestAudioPath(modelInstance?: any): Promise<string> {
-  if (Platform.OS === "android") {
-    return "/data/local/tmp/test.wav";
-  }
-  const source = Image.resolveAssetSource(TEST_AUDIO_ASSET);
-  if (source.uri.startsWith("file://")) {
-    return source.uri.replace("file://", "");
-  }
-  if (modelInstance?.downloadModel) {
-    return await modelInstance.downloadModel(source.uri, "test_audio.wav");
-  }
-  throw new Error(
-    "Cannot resolve test audio path in dev mode without model instance",
-  );
-}
-
-const THEME = {
-  bg: "#050505",
-  card: "#121212",
-  accent: "#3B82F6",
-  success: "#10B981",
-  warning: "#F59E0B",
-  error: "#EF4444",
-  text: "#F9FAF7",
-  textDim: "#9CA3AF",
-  border: "#262626",
+// ─── Theme ───────────────────────────────────────────────────────────────────
+const T = {
+  bg: "#08080C",
+  surface: "#111118",
+  card: "#16161F",
+  elevated: "#1C1C28",
+  accent: "#6366F1", // Indigo
+  accentGlow: "#818CF8",
+  success: "#34D399",
+  warning: "#FBBF24",
+  error: "#F87171",
+  cyan: "#22D3EE",
+  text: "#F1F1F4",
+  dim: "#6B7280",
+  muted: "#3F3F50",
+  border: "#23232F",
 };
 
-type LogEntry = {
-  timestamp: number;
-  message: string;
-  type: "info" | "success" | "error";
-};
+const MONO = Platform.OS === "ios" ? "Menlo" : "monospace";
+const { width: SCREEN_W } = Dimensions.get("window");
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const value = bytes / Math.pow(1024, i);
-  return `${value.toFixed(i > 1 ? 1 : 0)} ${units[i]}`;
+// ─── Types ───────────────────────────────────────────────────────────────────
+type ChatMsg = { role: "user" | "model"; text: string; ts: number };
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function fmtBytes(b: number): string {
+  if (b === 0) return "0 B";
+  const u = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return `${(b / Math.pow(1024, i)).toFixed(i > 1 ? 1 : 0)} ${u[i]}`;
 }
 
+// ─── Model options ───────────────────────────────────────────────────────────
+const MODELS = {
+  gemma3n: { label: "Gemma 3n E2B", size: "1.3 GB", url: GEMMA_3N_E2B_IT_INT4 },
+  gemma4: { label: "Gemma 4 E2B", size: "2.6 GB", url: GEMMA_4_E2B_IT },
+} as const;
+type ModelKey = keyof typeof MODELS;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// App
+// ═══════════════════════════════════════════════════════════════════════════════
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -101,26 +93,27 @@ export default function App() {
 }
 
 function Main() {
-  const [useGpu, setUseGpu] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<"gemma3n" | "gemma4">(
-    "gemma4",
-  );
-
-  const MODEL_OPTIONS = {
-    gemma3n: { label: "Gemma 3n E2B (1.3 GB)", url: GEMMA_3N_E2B_IT_INT4 },
-    gemma4: { label: "Gemma 4 E2B (2.6 GB)", url: GEMMA_4_E2B_IT },
-  };
+  // ── State ─────────────────────────────────────────────────────────────────
+  const [sel, setSel] = useState<ModelKey>("gemma4");
+  const [backend, setBackend] = useState<"cpu" | "gpu">("cpu");
+  const [chat, setChat] = useState<ChatMsg[]>([]);
+  const [input, setInput] = useState("");
+  const [streaming, setStreaming] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [liveMemory, setLiveMemory] = useState<MemoryUsage | null>(null);
+  const scrollRef = useRef<ScrollView>(null);
 
   const config = useMemo(
     () => ({
-      backend: useGpu ? ("gpu" as const) : ("cpu" as const),
-      systemPrompt: "You are a helpful assistant.",
+      backend,
+      systemPrompt: "You are a helpful assistant. Keep responses concise.",
       maxTokens: 1024,
       autoLoad: false,
       enableMemoryTracking: true,
       maxMemorySnapshots: 100,
     }),
-    [useGpu],
+    [backend],
   );
 
   const {
@@ -128,739 +121,728 @@ function Main() {
     isReady,
     downloadProgress,
     error,
-    deleteModel,
     load,
-    memoryTracker,
+    deleteModel,
     memorySummary,
-  } = useModel(MODEL_OPTIONS[selectedModel].url, config);
+  } = useModel(MODELS[sel].url, config);
 
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-  const [lastLatency, setLastLatency] = useState<number | null>(null);
-  const [tokensPerSec, setTokensPerSec] = useState<number | null>(null);
-  const [chatInput, setChatInput] = useState("");
+  // ── Scroll to bottom on new messages ──────────────────────────────────────
+  useEffect(() => {
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
+  }, [chat, streaming]);
 
-  const log = useCallback(
-    (message: string, type: LogEntry["type"] = "info") => {
-      console.log(`[App] ${message}`);
-      setLogs((prev) => [
-        { timestamp: Date.now(), message, type },
-        ...prev.slice(0, 99),
-      ]);
-    },
-    [],
-  );
-
-  const runFullTest = async () => {
-    if (isRunning || !isReady) return;
-    setIsRunning(true);
-    setLogs([]);
+  // ── Send message ──────────────────────────────────────────────────────────
+  const send = useCallback(async () => {
+    if (!model || !input.trim() || busy) return;
+    const msg = input.trim();
+    setInput("");
+    setBusy(true);
+    setChat((prev) => [...prev, { role: "user", text: msg, ts: Date.now() }]);
+    setStreaming("");
 
     try {
-      log("Starting Full Test Suite...", "info");
-
-      // Test 1: Hook state
-      log(
-        `Model instance: ${!!model ? "✓" : "✗"}`,
-        model ? "success" : "error",
-      );
-      log(`isReady: ${isReady}`, "success");
-
-      // Test 2: Backend support
-      const cpuWarn = checkBackendSupport("cpu");
-      const gpuWarn = checkBackendSupport("gpu");
-      const npuWarn = checkBackendSupport("npu");
-      log(`CPU: ${cpuWarn ?? "OK"}`);
-      log(`GPU: ${gpuWarn ?? "OK"}`);
-      log(`NPU: ${npuWarn ?? "OK"}`);
-
-      // Test 3: Multimodal
-      const mmError = checkMultimodalSupport();
-      log(
-        mmError ? `Multimodal: ${mmError}` : "Multimodal supported",
-        mmError ? "info" : "success",
-      );
-
-      // Test 4: Templates
-      const hist: ChatMessage[] = [
-        { role: "user", content: "Hello!" },
-        { role: "model", content: "Hi!" },
-        { role: "user", content: "How are you?" },
-      ];
-      const tpl = applyGemmaTemplate(hist, "You are helpful.");
-      log(`Gemma template: ${tpl.length} chars`, "success");
-
-      // Test 5: Inference
-      if (!model) throw new Error("Model not available");
-      log("Running inference...");
-      const t0 = Date.now();
-      const response = await model.sendMessage(
-        "What is 2+2? Answer with just the number.",
-      );
-      const elapsed = Date.now() - t0;
-      setLastLatency(elapsed);
-      log(`Response: "${response}"`, "success");
-      log(`Latency: ${elapsed}ms`, "success");
-
-      // Test 6: Stats
-      const stats = model.getStats();
-      setTokensPerSec(stats.tokensPerSecond);
-      log(
-        `Speed: ${stats.tokensPerSecond.toFixed(1)} tok/s | Prompt: ${stats.promptTokens} | Completion: ${stats.completionTokens}`,
-        "success",
-      );
-
-      // Test 7: Context
-      await model.sendMessage("My name is TestUser.");
-      const nameResp = await model.sendMessage("What is my name?");
-      log(`Context test: "${nameResp}"`, "success");
-
-      // Test 8: Reset
-      model.resetConversation();
-      log("Conversation reset", "success");
-
-      // Test 9: Streaming
-      let streamCount = 0;
       await new Promise<void>((resolve) => {
-        model.sendMessageAsync(
-          "Count from 1 to 5.",
-          (token: string, done: boolean) => {
-            streamCount++;
-            if (done) {
-              log(`Streaming: ${streamCount} callbacks`, "success");
-              resolve();
-            }
-          },
-        );
-      });
-
-      // Test 10: Memory tracking (real OS-level data)
-      if (memoryTracker) {
-        const summary = memoryTracker.getSummary();
-        log(
-          `Memory tracker: ${summary.snapshotCount} snapshots, buffer ${formatBytes(summary.trackerBufferSizeBytes)}`,
-          "success",
-        );
-        log(
-          `RSS: ${formatBytes(summary.currentResidentBytes)} | Peak: ${formatBytes(summary.peakResidentBytes)}`,
-          "success",
-        );
-        log(
-          `Native Heap: ${formatBytes(summary.currentNativeHeapBytes)} | Peak: ${formatBytes(summary.peakNativeHeapBytes)}`,
-          "success",
-        );
-
-        // Also test getMemoryUsage() directly
-        const liveUsage = model.getMemoryUsage();
-        log(
-          `Live RSS: ${formatBytes(liveUsage.residentBytes)} | Native: ${formatBytes(liveUsage.nativeHeapBytes)} | Avail: ${formatBytes(liveUsage.availableMemoryBytes)} | Low: ${liveUsage.isLowMemory}`,
-          "success",
-        );
-
-        const standalone = createMemoryTracker(10);
-        standalone.record({
-          timestamp: Date.now(),
-          nativeHeapBytes: liveUsage.nativeHeapBytes,
-          residentBytes: liveUsage.residentBytes,
-          availableMemoryBytes: liveUsage.availableMemoryBytes,
-        });
-        log(
-          `Standalone tracker: ${standalone.getLatestSnapshot() ? "OK" : "FAIL"} (${formatBytes(standalone.getNativeBuffer().byteLength)} native)`,
-          standalone.getLatestSnapshot() ? "success" : "error",
-        );
-      } else {
-        log("Memory tracking disabled", "info");
-      }
-
-      // Test 11: Image (vision)
-      // Vision executor needs ~2GB additional memory on top of the text model.
-      // Skip if insufficient memory to avoid jetsam kills.
-      // Also skip on iOS — XCFramework lacks compiled vision executor ops.
-      if (Platform.OS === "ios") {
-        log("Image skipped (iOS XCFramework lacks vision executor ops)", "info");
-      } else {
-        const memBeforeImage = model.getMemoryUsage();
-        const availGB =
-          memBeforeImage.availableMemoryBytes / (1024 * 1024 * 1024);
-        if (availGB < 4.0) {
-          log(
-            `Image skipped: only ${availGB.toFixed(1)} GB available (need ~4 GB for vision encoder)`,
-            "info",
-          );
-        } else {
-          try {
-            const imagePath = await getTestImagePath(model);
-            log(`Image path: ${imagePath}`);
-            const imgResp = await model.sendMessageWithImage(
-              "Describe this image in one sentence.",
-              imagePath,
-            );
-            log(`Image: "${imgResp}"`, "success");
-          } catch (e: any) {
-            log(`Image test: ${e.message}`, "error");
+        let full = "";
+        model.sendMessageAsync(msg, (token: string, done: boolean) => {
+          if (!done) {
+            full += token;
+            setStreaming(full);
+          } else {
+            setChat((prev) => [
+              ...prev,
+              { role: "model", text: full, ts: Date.now() },
+            ]);
+            setStreaming("");
+            resolve();
           }
-        }
-      }
-
-      // Test 12: Audio (not yet supported on iOS — audio executor ops missing from XCFramework)
-      if (Platform.OS !== "ios") {
-        try {
-          const audioPath = await getTestAudioPath(model);
-          log(`Audio path: ${audioPath}`);
-          const audioResp = await model.sendMessageWithAudio(
-            "Transcribe this audio.",
-            audioPath,
-          );
-          log(`Audio: "${audioResp}"`, "success");
-        } catch (e: any) {
-          log(`Audio test: ${e.message}`, "error");
-        }
-      } else {
-        log("Audio skipped (iOS XCFramework lacks audio executor ops)", "info");
-      }
-
-      log("All tests complete.", "success");
-    } catch (err) {
-      log(
-        `Error: ${err instanceof Error ? err.message : String(err)}`,
-        "error",
-      );
-      console.error(err);
+        });
+      });
+      // Refresh memory stats
+      try {
+        setLiveMemory(model.getMemoryUsage());
+      } catch {}
+    } catch (e: any) {
+      setChat((prev) => [
+        ...prev,
+        { role: "model", text: `Error: ${e.message}`, ts: Date.now() },
+      ]);
     } finally {
-      setIsRunning(false);
+      setBusy(false);
     }
-  };
+  }, [model, input, busy]);
 
-  const getStatusLabel = (): { text: string; color: string } => {
-    if (error) return { text: "Error", color: THEME.error };
-    if (isRunning) return { text: "Running", color: THEME.warning };
-    if (isReady) return { text: "Ready", color: THEME.success };
-    if (downloadProgress > 0 && downloadProgress < 1)
-      return {
-        text: `${(downloadProgress * 100).toFixed(0)}%`,
-        color: THEME.accent,
-      };
-    if (downloadProgress === 1)
-      return { text: "Loading", color: THEME.warning };
-    return { text: "Not Loaded", color: THEME.textDim };
-  };
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  const stats = model && isReady ? model.getStats() : null;
 
-  const status = getStatusLabel();
+  // ── Download state helpers ────────────────────────────────────────────────
+  const isDownloading = downloadProgress > 0 && downloadProgress < 1;
+  const isLoading = downloadProgress === 1 && !isReady;
+  const canInteract = !isReady && !isDownloading && !isLoading;
+  const gpuWarning = useMemo(() => checkBackendSupport("gpu"), []);
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        <Header />
-
-        <View style={styles.grid}>
-          <DiagnosticCard
-            label="Status"
-            value={status.text}
-            icon="🔋"
-            color={status.color}
-          />
-          <DiagnosticCard
-            label="Latency"
-            value={lastLatency ? `${lastLatency}ms` : "--"}
-            icon="⏱️"
-          />
+    <SafeAreaView style={s.root}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        keyboardVerticalOffset={0}
+      >
+        {/* ── Header ─────────────────────────────────────────────────────── */}
+        <View style={s.header}>
+          <View>
+            <Text style={s.brand}>
+              react-native-<Text style={{ color: T.accent }}>litert-lm</Text>
+            </Text>
+            <Text style={s.tagline}>
+              On-device AI •{" "}
+              {Platform.OS === "ios" ? "Metal" : backend.toUpperCase()}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={s.settingsBtn}
+            onPress={() => setShowSettings(!showSettings)}
+          >
+            <Text style={{ fontSize: 18, color: T.text }}>
+              {showSettings ? "✕" : "⚙"}
+            </Text>
+          </TouchableOpacity>
         </View>
 
-        {tokensPerSec !== null && (
-          <View style={[styles.grid, { marginTop: 0 }]}>
-            <DiagnosticCard
+        {/* ── Settings drawer ────────────────────────────────────────────── */}
+        {showSettings && (
+          <View style={s.drawer}>
+            <Text style={s.drawerTitle}>Model</Text>
+            <View style={s.pillRow}>
+              {(Object.keys(MODELS) as ModelKey[]).map((k) => (
+                <TouchableOpacity
+                  key={k}
+                  disabled={!canInteract}
+                  onPress={() => setSel(k)}
+                  style={[
+                    s.pill,
+                    sel === k && s.pillActive,
+                    !canInteract && { opacity: 0.5 },
+                  ]}
+                >
+                  <Text style={[s.pillText, sel === k && s.pillTextActive]}>
+                    {MODELS[k].label}
+                  </Text>
+                  <Text style={s.pillSub}>{MODELS[k].size}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={[s.drawerTitle, { marginTop: 14 }]}>Backend</Text>
+            <View style={s.pillRow}>
+              {(["cpu", "gpu"] as const).map((b) => {
+                const warning = b === "gpu" ? gpuWarning : undefined;
+                const isDisabled = !canInteract || !!warning;
+                return (
+                  <TouchableOpacity
+                    key={b}
+                    disabled={isDisabled}
+                    onPress={() => setBackend(b)}
+                    style={[
+                      s.pill,
+                      backend === b && s.pillActive,
+                      isDisabled && { opacity: 0.4 },
+                    ]}
+                  >
+                    <Text
+                      style={[s.pillText, backend === b && s.pillTextActive]}
+                    >
+                      {b.toUpperCase()}
+                    </Text>
+                    {!!warning && <Text style={s.pillSub}>Not supported</Text>}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            {gpuWarning ? (
+              <Text style={s.backendWarning}>{gpuWarning}</Text>
+            ) : null}
+
+            {memorySummary && memorySummary.snapshotCount > 0 && (
+              <>
+                <Text style={[s.drawerTitle, { marginTop: 14 }]}>Memory</Text>
+                <View style={s.memRow}>
+                  <MiniStat
+                    label="RSS"
+                    value={fmtBytes(memorySummary.currentResidentBytes)}
+                  />
+                  <MiniStat
+                    label="Heap"
+                    value={fmtBytes(memorySummary.currentNativeHeapBytes)}
+                  />
+                  <MiniStat
+                    label="Avail"
+                    value={
+                      liveMemory
+                        ? fmtBytes(liveMemory.availableMemoryBytes)
+                        : "—"
+                    }
+                  />
+                </View>
+                <View style={[s.memRow, { marginTop: 6 }]}>
+                  <MiniStat
+                    label="Peak RSS"
+                    value={fmtBytes(memorySummary.peakResidentBytes)}
+                  />
+                  <MiniStat
+                    label="Peak Heap"
+                    value={fmtBytes(memorySummary.peakNativeHeapBytes)}
+                  />
+                  <MiniStat
+                    label="Snapshots"
+                    value={`${memorySummary.snapshotCount}`}
+                  />
+                </View>
+              </>
+            )}
+
+            {isReady && (
+              <TouchableOpacity
+                style={s.dangerBtn}
+                onPress={async () => {
+                  const fn =
+                    sel === "gemma4"
+                      ? "gemma-4-E2B-it.litertlm"
+                      : "gemma-3n-E2B-it-int4.litertlm";
+                  try {
+                    await deleteModel(fn);
+                  } catch {}
+                }}
+              >
+                <Text style={s.dangerText}>Delete Cached Model</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+
+        {/* ── Status / Load ──────────────────────────────────────────────── */}
+        {!isReady && (
+          <View style={s.statusCard}>
+            <PulseRing active={isDownloading || isLoading} />
+            <View style={{ flex: 1, marginLeft: 16 }}>
+              <Text style={s.statusTitle}>
+                {isDownloading
+                  ? `Downloading ${(downloadProgress * 100).toFixed(0)}%`
+                  : isLoading
+                    ? "Loading engine…"
+                    : "Model not loaded"}
+              </Text>
+              <Text style={s.statusSub}>
+                {MODELS[sel].label} • {MODELS[sel].size} •{" "}
+                {backend.toUpperCase()}
+              </Text>
+              {error && <Text style={s.errorText}>{error}</Text>}
+            </View>
+            {canInteract && (
+              <TouchableOpacity style={s.loadBtn} onPress={load}>
+                <Text style={s.loadBtnText}>Load</Text>
+              </TouchableOpacity>
+            )}
+            {(isDownloading || isLoading) && (
+              <ActivityIndicator color={T.accent} style={{ marginLeft: 12 }} />
+            )}
+          </View>
+        )}
+
+        {/* ── Metrics bar ────────────────────────────────────────────────── */}
+        {isReady && (
+          <View style={s.metricsBar}>
+            <MetricChip
               label="Speed"
-              value={`${tokensPerSec.toFixed(1)} tok/s`}
-              icon="⚡"
-              color={THEME.success}
+              value={
+                stats?.tokensPerSecond
+                  ? `${stats.tokensPerSecond.toFixed(1)}`
+                  : "—"
+              }
+              unit="tok/s"
+              color={T.success}
+            />
+            <MetricChip
+              label="Latency"
+              value={stats?.totalTime ? `${stats.totalTime.toFixed(0)}` : "—"}
+              unit="ms"
+              color={T.cyan}
+            />
+            <MetricChip
+              label="Tokens"
+              value={
+                stats?.completionTokens
+                  ? `${Math.round(stats.completionTokens)}`
+                  : "—"
+              }
+              unit=""
+              color={T.warning}
             />
           </View>
         )}
 
-        <Section title="Device">
-          <InfoRow
-            label="Platform"
-            value={`${Platform.OS} ${Platform.Version}`}
-          />
-          <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Gemma Model</Text>
-            <View style={{ flexDirection: "row", gap: 6 }}>
-              {(
-                Object.keys(MODEL_OPTIONS) as Array<keyof typeof MODEL_OPTIONS>
-              ).map((key) => (
-                <TouchableOpacity
-                  key={key}
-                  onPress={() => setSelectedModel(key)}
-                  disabled={isReady || isRunning || downloadProgress > 0}
-                  style={{
-                    paddingHorizontal: 10,
-                    paddingVertical: 4,
-                    borderRadius: 6,
-                    backgroundColor:
-                      selectedModel === key ? THEME.accent : THEME.border,
-                    opacity:
-                      isReady || isRunning || downloadProgress > 0 ? 0.5 : 1,
-                  }}
-                >
-                  <Text style={{ color: THEME.text, fontSize: 12 }}>
-                    {key === "gemma3n" ? "3n" : "4"}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-          <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Backend</Text>
-            <View
-              style={{ flexDirection: "row", alignItems: "center", gap: 8 }}
-            >
-              <Text style={styles.infoValue}>
-                {config.backend.toUpperCase()}
+        {/* ── Chat area ──────────────────────────────────────────────────── */}
+        <ScrollView
+          ref={scrollRef}
+          style={s.chatArea}
+          contentContainerStyle={s.chatContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          {!isReady && chat.length === 0 && (
+            <View style={s.emptyState}>
+              <Text style={s.emptyIcon}>✦</Text>
+              <Text style={s.emptyTitle}>LiteRT LM</Text>
+              <Text style={s.emptySub}>
+                Load a model to start chatting.{"\n"}
+                All inference runs on-device.
               </Text>
-              <Switch
-                value={useGpu}
-                onValueChange={setUseGpu}
-                disabled={isReady || isRunning || downloadProgress > 0}
-              />
             </View>
-          </View>
-          <InfoRow
-            label="Architecture"
-            value={Platform.OS === "ios" ? "arm64" : "arm64"}
-          />
-        </Section>
-
-        <Section title="Model">
-          {!isReady ? (
-            <View style={styles.warningBox}>
-              <Text style={styles.warningText}>
-                {downloadProgress > 0 && downloadProgress < 1
-                  ? `Downloading ${(downloadProgress * 100).toFixed(0)}%`
-                  : downloadProgress === 1
-                    ? "Loading Model..."
-                    : "Model Not Loaded"}
-              </Text>
-              <Text style={styles.instructionText}>
-                Download {MODEL_OPTIONS[selectedModel].label} or load from disk.
-                {selectedModel === "gemma4" && Platform.OS === "ios"
-                  ? "\n⚠️ Gemma 4 requires Extended Virtual Addressing entitlement on iOS."
-                  : ""}
-              </Text>
-              <View style={styles.buttonGroup}>
-                <TouchableOpacity
-                  style={[
-                    styles.primaryButton,
-                    downloadProgress > 0 && styles.disabledButton,
-                  ]}
-                  onPress={load}
-                  disabled={downloadProgress > 0 || isRunning}
-                >
-                  {downloadProgress > 0 ? (
-                    <ActivityIndicator color="#fff" />
-                  ) : (
-                    <Text style={styles.buttonText}>Download & Load</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-            </View>
-          ) : (
-            <>
-              <View style={styles.successBox}>
-                <Text style={styles.successText}>
-                  ✓ {MODEL_OPTIONS[selectedModel].label} Ready
-                </Text>
-              </View>
-              {error && (
-                <Text
-                  style={{
-                    color: THEME.error,
-                    fontSize: 13,
-                    marginTop: 8,
-                  }}
-                >
-                  {error}
-                </Text>
-              )}
-            </>
           )}
-        </Section>
 
-        <Section title="Test Suite">
-          <View style={styles.buttonGroup}>
+          {isReady && chat.length === 0 && (
+            <View style={s.emptyState}>
+              <Text style={s.emptyIcon}>💬</Text>
+              <Text style={s.emptyTitle}>Ready to chat</Text>
+              <Text style={s.emptySub}>
+                {MODELS[sel].label} loaded on {backend.toUpperCase()}.{"\n"}
+                Send a message to begin.
+              </Text>
+              <View style={s.suggestRow}>
+                {[
+                  "What is React Native?",
+                  "Tell me a joke",
+                  "Explain quantum computing",
+                ].map((q) => (
+                  <TouchableOpacity
+                    key={q}
+                    style={s.suggestChip}
+                    onPress={() => {
+                      setInput(q);
+                    }}
+                  >
+                    <Text style={s.suggestText}>{q}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          )}
+
+          {chat.map((m, i) => (
+            <ChatBubble key={i} msg={m} />
+          ))}
+
+          {streaming !== "" && (
+            <ChatBubble
+              msg={{ role: "model", text: streaming, ts: Date.now() }}
+              isStreaming
+            />
+          )}
+        </ScrollView>
+
+        {/* ── Input bar ──────────────────────────────────────────────────── */}
+        {isReady && (
+          <View style={s.inputBar}>
+            <TextInput
+              style={s.input}
+              placeholder="Message…"
+              placeholderTextColor={T.dim}
+              value={input}
+              onChangeText={setInput}
+              editable={!busy}
+              onSubmitEditing={send}
+              returnKeyType="send"
+              multiline
+            />
             <TouchableOpacity
-              style={[
-                styles.primaryButton,
-                (!isReady || isRunning) && styles.disabledButton,
-              ]}
-              onPress={runFullTest}
-              disabled={!isReady || isRunning}
+              style={[s.sendBtn, (!input.trim() || busy) && { opacity: 0.4 }]}
+              onPress={send}
+              disabled={!input.trim() || busy}
             >
-              {isRunning ? (
-                <ActivityIndicator color="#fff" />
+              {busy ? (
+                <ActivityIndicator color="#fff" size="small" />
               ) : (
-                <Text style={styles.buttonText}>Run All Tests</Text>
+                <Text style={s.sendIcon}>↑</Text>
               )}
             </TouchableOpacity>
-            {isReady && (
-              <TouchableOpacity
-                style={[styles.secondaryButton, { borderColor: THEME.error }]}
-                onPress={async () => {
-                  try {
-                    const fileName =
-                      selectedModel === "gemma4"
-                        ? "gemma-4-E2B-it.litertlm"
-                        : "gemma-3n-E2B-it-int4.litertlm";
-                    await deleteModel(fileName);
-                    log("Model deleted", "success");
-                  } catch (e: any) {
-                    log(`Delete failed: ${e.message}`, "error");
-                  }
-                }}
-              >
-                <Text style={[styles.buttonText, { color: THEME.error }]}>
-                  Delete
-                </Text>
-              </TouchableOpacity>
-            )}
           </View>
-        </Section>
-
-        {isReady && (
-          <Section title="Quick Chat">
-            <View style={styles.chatInputContainer}>
-              <TextInput
-                style={styles.chatInput}
-                placeholder="Type a message..."
-                placeholderTextColor={THEME.textDim}
-                value={chatInput}
-                onChangeText={setChatInput}
-                editable={!isRunning}
-              />
-              <TouchableOpacity
-                style={[
-                  styles.sendButton,
-                  (!chatInput.trim() || isRunning) && styles.disabledButton,
-                ]}
-                onPress={async () => {
-                  if (!model || !chatInput.trim()) return;
-                  const msg = chatInput.trim();
-                  setChatInput("");
-                  setIsRunning(true);
-                  log(`You: ${msg}`, "info");
-                  try {
-                    const t0 = Date.now();
-                    const resp = await model.sendMessage(msg);
-                    const elapsed = Date.now() - t0;
-                    setLastLatency(elapsed);
-                    log(`Model: ${resp}`, "success");
-                    const stats = model.getStats();
-                    setTokensPerSec(stats.tokensPerSecond);
-                  } catch (e: any) {
-                    log(`Error: ${e.message}`, "error");
-                  } finally {
-                    setIsRunning(false);
-                  }
-                }}
-                disabled={!chatInput.trim() || isRunning}
-              >
-                <Text style={styles.buttonText}>Send</Text>
-              </TouchableOpacity>
-            </View>
-          </Section>
         )}
-
-        {memorySummary && memorySummary.snapshotCount > 0 && (
-          <Section title="Native Memory Usage">
-            <View style={styles.memoryContainer}>
-              <Text style={styles.memoryHeader}>Process Memory (Real)</Text>
-              <InfoRow
-                label="Snapshots"
-                value={`${memorySummary.snapshotCount}`}
-              />
-              <InfoRow
-                label="Native Heap"
-                value={formatBytes(memorySummary.currentNativeHeapBytes)}
-              />
-              <InfoRow
-                label="Resident (RSS)"
-                value={formatBytes(memorySummary.currentResidentBytes)}
-              />
-              <InfoRow
-                label="Average RSS"
-                value={formatBytes(memorySummary.averageResidentBytes)}
-              />
-
-              <Text style={[styles.memoryHeader, { marginTop: 12 }]}>
-                Peak &amp; Delta
-              </Text>
-              <InfoRow
-                label="Peak RSS"
-                value={formatBytes(memorySummary.peakResidentBytes)}
-              />
-              <InfoRow
-                label="Peak Native Heap"
-                value={formatBytes(memorySummary.peakNativeHeapBytes)}
-              />
-              <InfoRow
-                label="RSS Delta"
-                value={`${memorySummary.residentDeltaBytes >= 0 ? "+" : ""}${formatBytes(Math.abs(memorySummary.residentDeltaBytes))}`}
-              />
-
-              <View style={styles.memoryTotalRow}>
-                <Text style={styles.memoryTotalLabel}>Peak RSS</Text>
-                <Text style={styles.memoryTotalValue}>
-                  {formatBytes(memorySummary.peakResidentBytes)}
-                </Text>
-              </View>
-            </View>
-          </Section>
-        )}
-
-        <Section title="System Logs">
-          {logs.length === 0 && (
-            <Text style={styles.logText}>No logs yet. Run tests to begin.</Text>
-          )}
-          {logs.map((entry, i) => (
-            <Text
-              key={i}
-              style={[
-                styles.logText,
-                entry.type === "error" && { color: THEME.error },
-                entry.type === "success" && { color: THEME.success },
-              ]}
-            >
-              • {entry.message}
-            </Text>
-          ))}
-        </Section>
-      </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
-function Header() {
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function ChatBubble({
+  msg,
+  isStreaming,
+}: {
+  msg: ChatMsg;
+  isStreaming?: boolean;
+}) {
+  const isUser = msg.role === "user";
   return (
-    <View style={styles.header}>
-      <Text style={styles.title}>
-        LiteRT <Text style={{ color: THEME.accent }}>LM</Text>
-      </Text>
-      <Text style={styles.subtitle}>On-Device LLM Inference Engine</Text>
+    <View style={[s.bubbleRow, isUser && { justifyContent: "flex-end" }]}>
+      {!isUser && (
+        <View style={s.avatar}>
+          <Text style={{ fontSize: 12 }}>✦</Text>
+        </View>
+      )}
+      <View style={[s.bubble, isUser ? s.bubbleUser : s.bubbleModel]}>
+        <Text style={[s.bubbleText, isUser && { color: "#fff" }]}>
+          {msg.text}
+          {isStreaming && <Text style={s.cursor}>▊</Text>}
+        </Text>
+      </View>
     </View>
   );
 }
 
-function DiagnosticCard({
+function MetricChip({
+  icon,
   label,
   value,
-  icon,
+  unit,
   color,
 }: {
+  icon?: string;
   label: string;
   value: string;
-  icon: string;
-  color?: string;
+  unit: string;
+  color: string;
 }) {
   return (
-    <View style={styles.card}>
-      <Text style={styles.cardIcon}>{icon}</Text>
-      <Text style={styles.cardLabel}>{label}</Text>
-      <Text style={[styles.cardValue, color ? { color } : undefined]}>
-        {value}
-      </Text>
+    <View style={s.metricChip}>
+      {icon ? <Text style={{ fontSize: 14 }}>{icon}</Text> : null}
+      <View style={icon ? { marginLeft: 6 } : undefined}>
+        <Text style={s.metricLabel}>{label}</Text>
+        <Text style={[s.metricValue, { color }]}>
+          {value} <Text style={s.metricUnit}>{unit}</Text>
+        </Text>
+      </View>
     </View>
   );
 }
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function MiniStat({ label, value }: { label: string; value: string }) {
   return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
-      {children}
+    <View style={s.miniStat}>
+      <Text style={s.miniLabel}>{label}</Text>
+      <Text style={s.miniValue}>{value}</Text>
     </View>
   );
 }
 
-function InfoRow({ label, value }: { label: string; value: string }) {
+function PulseRing({ active }: { active: boolean }) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (active) {
+      Animated.loop(
+        Animated.timing(anim, {
+          toValue: 1,
+          duration: 1500,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ).start();
+    } else {
+      anim.setValue(0);
+    }
+  }, [active]);
+
+  const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.4] });
+  const opacity = anim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.6, 0],
+  });
+
   return (
-    <View style={styles.infoRow}>
-      <Text style={styles.infoLabel}>{label}</Text>
-      <Text style={styles.infoValue}>{value}</Text>
+    <View
+      style={{
+        width: 40,
+        height: 40,
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      {active && (
+        <Animated.View
+          style={{
+            position: "absolute",
+            width: 40,
+            height: 40,
+            borderRadius: 20,
+            backgroundColor: T.accent,
+            transform: [{ scale }],
+            opacity,
+          }}
+        />
+      )}
+      <View
+        style={{
+          width: 24,
+          height: 24,
+          borderRadius: 12,
+          backgroundColor: active ? T.accent : T.muted,
+        }}
+      />
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: THEME.bg },
-  scrollContent: { padding: 20 },
-  header: { marginBottom: 24, marginTop: 10 },
-  title: {
-    fontSize: 32,
+// ═══════════════════════════════════════════════════════════════════════════════
+// Styles
+// ═══════════════════════════════════════════════════════════════════════════════
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: T.bg },
+
+  // Header
+  header: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  brand: {
+    fontSize: 26,
     fontWeight: "900",
-    color: THEME.text,
-    letterSpacing: -1,
+    color: T.text,
+    letterSpacing: -0.5,
   },
-  subtitle: { fontSize: 14, color: THEME.textDim, fontWeight: "500" },
-  grid: { flexDirection: "row", gap: 12, marginBottom: 20 },
-  card: {
-    flex: 1,
-    backgroundColor: THEME.card,
-    borderRadius: 16,
-    padding: 16,
+  tagline: { fontSize: 12, color: T.dim, marginTop: 2, fontWeight: "500" },
+  settingsBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: T.card,
+    alignItems: "center",
+    justifyContent: "center",
     borderWidth: 1,
-    borderColor: THEME.border,
+    borderColor: T.border,
   },
-  cardIcon: { fontSize: 20, marginBottom: 8 },
-  cardLabel: {
-    fontSize: 12,
-    color: THEME.textDim,
+
+  // Settings drawer
+  drawer: {
+    marginHorizontal: 16,
+    marginBottom: 12,
+    padding: 16,
+    backgroundColor: T.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  drawerTitle: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: T.dim,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    marginBottom: 8,
+  },
+  pillRow: { flexDirection: "row", gap: 8 },
+  pill: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: T.card,
+    borderWidth: 1,
+    borderColor: T.border,
+    alignItems: "center",
+  },
+  pillActive: {
+    borderColor: T.accent,
+    backgroundColor: "rgba(99,102,241,0.12)",
+  },
+  pillText: { fontSize: 13, fontWeight: "700", color: T.dim },
+  pillTextActive: { color: T.accentGlow },
+  pillSub: { fontSize: 10, color: T.dim, marginTop: 2 },
+  backendWarning: {
+    fontSize: 11,
+    color: "#f5a623",
+    marginTop: 6,
+    lineHeight: 15,
+    fontStyle: "italic",
+  },
+  dangerBtn: {
+    marginTop: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: T.error,
+    alignItems: "center",
+  },
+  dangerText: { color: T.error, fontWeight: "700", fontSize: 13 },
+  memRow: { flexDirection: "row", gap: 8 },
+  miniStat: {
+    flex: 1,
+    backgroundColor: T.card,
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  miniLabel: {
+    fontSize: 10,
+    color: T.dim,
     fontWeight: "600",
     textTransform: "uppercase",
   },
-  cardValue: {
-    fontSize: 20,
-    fontWeight: "800",
-    color: THEME.text,
+  miniValue: {
+    fontSize: 13,
+    color: T.text,
+    fontWeight: "700",
+    fontFamily: MONO,
     marginTop: 2,
   },
-  section: { marginBottom: 24 },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: THEME.textDim,
-    textTransform: "uppercase",
-    letterSpacing: 1,
+
+  // Status card
+  statusCard: {
+    marginHorizontal: 16,
     marginBottom: 12,
-  },
-  infoRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 8,
-    paddingBottom: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: THEME.border,
-  },
-  infoLabel: { fontSize: 14, color: THEME.textDim },
-  infoValue: { fontSize: 14, color: THEME.text, fontWeight: "600" },
-  primaryButton: {
-    backgroundColor: THEME.accent,
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: "center",
-    minHeight: 48,
-    flex: 1,
-  },
-  secondaryButton: {
-    backgroundColor: THEME.card,
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: "center",
-    flex: 1,
-    borderWidth: 1,
-    borderColor: THEME.border,
-  },
-  buttonGroup: { flexDirection: "row", gap: 12, marginTop: 16 },
-  buttonText: {
-    color: "#fff",
-    fontWeight: "700",
-    fontSize: 15,
-    textAlign: "center",
-  },
-  disabledButton: { opacity: 0.5 },
-  successBox: {
-    backgroundColor: "rgba(16, 185, 129, 0.1)",
-    padding: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: THEME.success,
-  },
-  successText: { color: THEME.success, fontWeight: "700", textAlign: "center" },
-  warningBox: {
-    backgroundColor: "rgba(245, 158, 11, 0.1)",
     padding: 16,
-    borderRadius: 12,
+    backgroundColor: T.surface,
+    borderRadius: 16,
     borderWidth: 1,
-    borderColor: THEME.warning,
-    gap: 10,
+    borderColor: T.border,
+    flexDirection: "row",
+    alignItems: "center",
   },
-  warningText: {
-    color: THEME.warning,
-    fontWeight: "800",
-    fontSize: 16,
-    textAlign: "center",
+  statusTitle: { fontSize: 15, fontWeight: "700", color: T.text },
+  statusSub: { fontSize: 12, color: T.dim, marginTop: 2 },
+  errorText: { fontSize: 12, color: T.error, marginTop: 4 },
+  loadBtn: {
+    backgroundColor: T.accent,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 10,
+    marginLeft: 12,
   },
-  instructionText: {
-    color: THEME.textDim,
-    fontSize: 13,
-    textAlign: "center",
-    lineHeight: 18,
-  },
-  logText: {
-    fontSize: 12,
-    color: THEME.textDim,
-    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
-    marginBottom: 4,
-  },
-  memoryContainer: {
-    backgroundColor: THEME.card,
-    borderRadius: 12,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: THEME.border,
-  },
-  memoryHeader: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: THEME.accent,
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
+  loadBtnText: { color: "#fff", fontWeight: "800", fontSize: 14 },
+
+  // Metrics bar
+  metricsBar: {
+    flexDirection: "row",
+    gap: 8,
+    marginHorizontal: 16,
     marginBottom: 8,
   },
-  memoryTotalRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 12,
-    paddingTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: THEME.accent,
-  },
-  memoryTotalLabel: {
-    fontSize: 14,
-    color: THEME.text,
-    fontWeight: "800",
-  },
-  memoryTotalValue: {
-    fontSize: 14,
-    color: THEME.accent,
-    fontWeight: "800",
-    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
-  },
-  chatInputContainer: {
-    flexDirection: "row",
-    gap: 10,
-    alignItems: "center",
-  },
-  chatInput: {
+  metricChip: {
     flex: 1,
-    backgroundColor: THEME.card,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: T.surface,
     borderRadius: 12,
-    padding: 14,
-    color: THEME.text,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  metricLabel: {
+    fontSize: 10,
+    color: T.dim,
+    fontWeight: "600",
+    textTransform: "uppercase",
+  },
+  metricValue: { fontSize: 15, fontWeight: "800", fontFamily: MONO },
+  metricUnit: { fontSize: 10, fontWeight: "500", color: T.dim },
+
+  // Chat
+  chatArea: { flex: 1 },
+  chatContent: { paddingHorizontal: 16, paddingBottom: 12, flexGrow: 1 },
+  emptyState: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 60,
+  },
+  emptyIcon: { fontSize: 36, marginBottom: 12, color: T.accent },
+  emptyTitle: { fontSize: 20, fontWeight: "800", color: T.text },
+  emptySub: {
+    fontSize: 14,
+    color: T.dim,
+    textAlign: "center",
+    marginTop: 6,
+    lineHeight: 20,
+  },
+  suggestRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 20,
+    justifyContent: "center",
+  },
+  suggestChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    backgroundColor: T.card,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  suggestText: { fontSize: 13, color: T.accentGlow, fontWeight: "600" },
+
+  // Bubbles
+  bubbleRow: { flexDirection: "row", alignItems: "flex-end", marginBottom: 10 },
+  avatar: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: T.card,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  bubble: {
+    maxWidth: SCREEN_W * 0.75,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 18,
+  },
+  bubbleUser: { backgroundColor: T.accent, borderBottomRightRadius: 4 },
+  bubbleModel: {
+    backgroundColor: T.card,
+    borderBottomLeftRadius: 4,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  bubbleText: { fontSize: 15, color: T.text, lineHeight: 21 },
+  cursor: { color: T.accentGlow, fontSize: 14 },
+
+  // Input
+  inputBar: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: T.bg,
+    borderTopWidth: 1,
+    borderTopColor: T.border,
+  },
+  input: {
+    flex: 1,
+    backgroundColor: T.surface,
+    borderRadius: 22,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    color: T.text,
     fontSize: 15,
     borderWidth: 1,
-    borderColor: THEME.border,
+    borderColor: T.border,
+    maxHeight: 100,
   },
-  sendButton: {
-    backgroundColor: THEME.accent,
-    paddingVertical: 14,
-    paddingHorizontal: 20,
-    borderRadius: 12,
+  sendBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: T.accent,
     alignItems: "center",
-    minHeight: 48,
+    justifyContent: "center",
   },
+  sendIcon: { color: "#fff", fontSize: 20, fontWeight: "900" },
 });

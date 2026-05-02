@@ -149,7 +149,9 @@ private:
   // Streaming callback context (must be a plain struct for C function pointer)
   struct StreamContext {
     std::function<void(const std::string&, bool)> onToken;
-    std::string fullResponse;
+    std::string rawResponse;     // Raw accumulated chunks (before stripping)
+    std::string fullResponse;    // Clean accumulated text (after stripping)
+    size_t lastEmittedLength;    // Length of fullResponse already emitted to JS
     std::vector<Message>* history;
     std::mutex* historyMutex;
     std::string userMessage;

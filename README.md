@@ -6,7 +6,7 @@ High-performance on-device LLM inference for React Native, powered by [LiteRT-LM
 
 - 🚀 **Native Performance** — Kotlin (Android) / C++ (iOS) via Nitro Modules JSI bindings
 - 🧠 **Gemma 4 Ready** — First-class support for Gemma 4 E2B/E4B multimodal models (text + vision + audio)
-- ⚡ **GPU Acceleration** — GPU delegate (Android), Metal/MPS (iOS)
+- ⚡ **GPU Acceleration** — Metal (iOS), OpenCL GPU delegate (Android, Pixel devices)
 - 🔄 **Streaming Support** — Token-by-token generation callbacks
 - 📱 **Cross-Platform** — Android API 26+ / iOS 15.0+
 - 🖼️ **Multimodal** — Image and audio input support
@@ -14,6 +14,12 @@ High-performance on-device LLM inference for React Native, powered by [LiteRT-LM
 - 📊 **Real Memory Tracking** — OS-level memory metrics (RSS, native heap, available memory) via native APIs
 - 🧮 **Zero-Copy Buffers** — Memory snapshots stored in native ArrayBuffers via Nitro Modules
 - 📥 **Automatic Model Download** — Downloads models from URL with progress tracking and local caching
+
+## Demo
+
+> Gemma 4 E2B running on-device on a Samsung Galaxy S22 (Snapdragon 8 Gen 1, 4 GB RAM) — CPU backend, streaming inference.
+
+<video src="https://github.com/user-attachments/assets/1da527ce-0432-4f8b-8899-474f81b2feea" width="300" controls />
 
 ## Installation
 
@@ -312,8 +318,8 @@ const buffer = tracker.getNativeBuffer();
 
 All exported model URLs are **public — no authentication required**. Pass them directly to `useModel()` or `loadModel()` for automatic downloading with progress tracking and local caching.
 
-| Constant               | Model                           | Size    | Min RAM | Source     |
-| :--------------------- | :------------------------------ | :------ | :------ | :--------- |
+| Constant               | Model                           | Size    | Min RAM | Source      |
+| :--------------------- | :------------------------------ | :------ | :------ | :---------- |
 | `GEMMA_4_E2B_IT`       | Gemma 4 E2B (Multimodal, IT)    | 2.58 GB | 4 GB+   | HuggingFace |
 | `GEMMA_4_E4B_IT`       | Gemma 4 E4B (Higher Quality)    | 3.65 GB | 6 GB+   | HuggingFace |
 | `GEMMA_3N_E2B_IT_INT4` | Gemma 3n E2B (Int4, Multimodal) | ~1.3 GB | 4 GB+   | litert.dev  |
@@ -355,13 +361,15 @@ Loads a model from a local path or HTTPS URL.
 
 #### Backend Options
 
-| Backend | Engine              | Speed   | Notes                                          |
-| ------- | ------------------- | ------- | ---------------------------------------------- |
-| `'cpu'` | CPU inference       | Slowest | Always available, lower RAM requirement        |
-| `'gpu'` | GPU / Metal         | Fast    | Recommended default                            |
-| `'npu'` | NPU / Neural Engine | Fastest | Requires supported hardware; falls back to GPU |
+| Backend | Engine                         | Speed   | Notes                                                                              |
+| ------- | ------------------------------ | ------- | ---------------------------------------------------------------------------------- |
+| `'cpu'` | CPU inference                  | Slowest | Always available on all devices                                                    |
+| `'gpu'` | Metal (iOS) / OpenCL (Android) | Fast    | iOS: always available. Android: requires OpenCL (Pixel only, not Samsung/Qualcomm) |
+| `'npu'` | NPU / Neural Engine            | Fastest | Requires supported hardware; experimental                                          |
 
-> **iOS**: `'cpu'` is the recommended default backend. `'gpu'` (Metal/MPS) is also supported. The engine automatically tries multiple backend combinations if the primary one fails.
+> **iOS**: Both `'cpu'` and `'gpu'` (Metal) are supported. The engine automatically tries fallback backend combinations if the primary one fails.
+>
+> **Android GPU**: The GPU backend requires OpenCL, which is **not available on most Samsung and Qualcomm devices**. Use `checkBackendSupport('gpu')` to check before loading. The engine will throw a clear error if GPU is unsupported.
 
 ### `sendMessage(message): Promise<string>`
 
@@ -386,13 +394,15 @@ Returns performance metrics from the last inference call.
 ```typescript
 interface GenerationStats {
   tokensPerSecond: number;
-  totalTime: number; // seconds
-  timeToFirstToken: number; // seconds
+  totalTime: number; // milliseconds
+  timeToFirstToken: number; // milliseconds
   promptTokens: number;
   completionTokens: number;
-  prefillSpeed: number; // tokens/sec
+  totalTokens: number;
 }
 ```
+
+> **Note**: Stats are available for both sync (`sendMessage`) and streaming (`sendMessageAsync`) on both platforms. iOS uses real benchmark data from the C API; Android uses heuristic token counts (~4 chars/token) with precise timing.
 
 ### `getMemoryUsage(): MemoryUsage`
 
@@ -435,10 +445,21 @@ import {
   applyLlamaTemplate,
 } from "react-native-litert-lm";
 
-// Check if a backend is supported
-const warning = checkBackendSupport("npu"); // string | undefined
+// Check if GPU is supported on this device
+const gpuWarning = checkBackendSupport("gpu");
+if (gpuWarning) {
+  console.warn(gpuWarning);
+  // "GPU backend requires OpenCL support, which is unavailable on most Samsung and Qualcomm devices."
+}
+
+// Check NPU support
+const npuWarning = checkBackendSupport("npu"); // string | undefined
+
+// Check multimodal support
 const mmError = checkMultimodalSupport(); // string | undefined
-const backend = getRecommendedBackend(); // 'gpu' | 'cpu'
+
+// Get recommended backend
+const backend = getRecommendedBackend(); // 'cpu'
 
 // Manual prompt formatting (advanced)
 const prompt = applyGemmaTemplate(
@@ -459,10 +480,10 @@ const prompt = applyGemmaTemplate(
 
 ## Platform Support
 
-| Platform | Status   | Architecture | Backends         |
-| -------- | -------- | ------------ | ---------------- |
-| Android  | ✅ Ready | arm64-v8a    | CPU, GPU, NPU    |
-| iOS      | ✅ Ready | arm64        | CPU, GPU (Metal) |
+| Platform | Status   | Architecture | Backends                                          |
+| -------- | -------- | ------------ | ------------------------------------------------- |
+| Android  | ✅ Ready | arm64-v8a    | CPU (all devices), GPU (OpenCL devices only), NPU |
+| iOS      | ✅ Ready | arm64        | CPU, GPU (Metal — always available)               |
 
 ### iOS Feature Matrix
 
@@ -555,13 +576,20 @@ Additionally, `PromptTemplate` is patched at build time to use a simplified C++ 
 ├──────────────────────┬──────────────────────────┤
 │  Android (Kotlin)    │  iOS (C++)               │
 │  HybridLiteRTLM.kt   │  HybridLiteRTLM.cpp      │
-│  litertlm-android    │  LiteRTLM C API          │
+│  litertlm-android    │  LiteRT-LM C API         │
 │  AAR (GPU delegate)  │  XCFramework (Metal)     │
 └──────────────────────┴──────────────────────────┘
 ```
 
-- **Android**: Kotlin (`HybridLiteRTLM.kt`) interfacing with the `litertlm-android` AAR.
-- **iOS**: C++ (`HybridLiteRTLM.cpp`) interfacing with the LiteRT-LM C API via a prebuilt `LiteRTLM.xcframework`. All engine operations (load, inference, streaming) run on dedicated `pthread` threads with 8 MB stack to accommodate XNNPack's stack requirements. Platform-specific code (model downloading, file management) is in Objective-C++ (`ios/IOSDownloadHelper.mm`).
+- **Android**: Kotlin (`HybridLiteRTLM.kt`) interfacing with the `litertlm-android` AAR via the **Kotlin SDK**. The SDK handles control token stripping and turn management automatically. Engine validation probes for OpenCL availability before GPU initialization. `ConversationConfig` with `SamplerConfig` is passed for all conversations (matching the Gallery app pattern).
+- **iOS**: C++ (`HybridLiteRTLM.cpp`) interfacing with the LiteRT-LM **C API** via a prebuilt `LiteRTLM.xcframework`. Unlike the Kotlin SDK, the C API emits raw tokens including control sequences (`<end_of_turn>`, `<start_of_turn>`) and echoed user messages. The C++ layer implements a robust sanitization pipeline:
+  - **Accumulation-and-diff** — buffers the full response and emits only new deltas
+  - **`stripControlTokens()`** — removes all control sequences from the accumulated buffer
+  - **`safeEmitLength()`** — look-ahead buffering that withholds partial control tokens (e.g., `<end_of_tur`) from emission until the full token is received or the stream terminates
+  - **Echo mitigation** — strips echoed user messages from the raw stream
+  - **Final flush** — mandatory clean-and-flush step on stream termination
+
+  Platform-specific code (model downloading, file management) is in Objective-C++ (`ios/IOSDownloadHelper.mm`).
 
 > **For contributors**: Changes to `cpp/HybridLiteRTLM.cpp` do not affect Android. Feature changes must be applied to both the Kotlin and C++ implementations.
 

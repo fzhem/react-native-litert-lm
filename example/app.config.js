@@ -34,6 +34,8 @@ module.exports = {
       [
         "expo-build-properties",
         {
+          buildReactNativeFromSource: true,
+          useHermesV1: true,
           android: {
             minSdkVersion: 26,
             compileSdkVersion: 36,

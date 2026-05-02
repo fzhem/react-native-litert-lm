@@ -132,6 +132,16 @@ export function getRecommendedBackend(): Backend {
  * ```
  */
 export function checkBackendSupport(backend: Backend): string | undefined {
+  if (backend === "gpu") {
+    if (Platform.OS === "android") {
+      // LiteRT-LM GPU delegate requires OpenCL, which is unavailable
+      // on most Samsung/Qualcomm devices. Only Pixel devices reliably expose it.
+      return "GPU backend requires OpenCL support, which is unavailable on most Samsung and Qualcomm devices.";
+    }
+    // iOS always supports GPU via Metal
+    return undefined;
+  }
+
   if (backend === "npu") {
     if (Platform.OS === "android") {
       return "NPU backend requires compatible hardware (Qualcomm Hexagon, MediaTek APU, etc.). Will fall back to GPU if unavailable.";

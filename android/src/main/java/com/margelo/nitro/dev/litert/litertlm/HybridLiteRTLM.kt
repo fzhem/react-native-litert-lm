@@ -17,6 +17,7 @@ import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.SamplerConfig
 import com.margelo.nitro.dev.litert.litertlm.Backend
 import com.margelo.nitro.dev.litert.litertlm.GenerationStats
 import com.margelo.nitro.dev.litert.litertlm.HybridLiteRTLMSpec
@@ -25,6 +26,11 @@ import com.margelo.nitro.dev.litert.litertlm.Message
 import com.margelo.nitro.dev.litert.litertlm.Role
 import com.margelo.nitro.core.Promise
 import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 
 // Alias to avoid confusion with our generated Message type
@@ -42,12 +48,25 @@ internal class StreamingCallbackListener(
     private val onToken: (String, Boolean) -> Unit,
     private val responseBuilder: StringBuilder,
     private val history: MutableList<Message>,
+    private val userMessage: String,
+    private val onStatsReady: (GenerationStats) -> Unit,
 ) : com.google.ai.edge.litertlm.MessageCallback {
 
-    override fun onMessage(responseMsg: com.google.ai.edge.litertlm.Message) {
-        val chunk = responseMsg.contents.contents
+    private val startTime = System.nanoTime()
+    private var firstTokenTime = 0L
+    private var tokenCount = 0
+
+    override fun onMessage(message: com.google.ai.edge.litertlm.Message) {
+        val chunk = message.contents.contents
             .filterIsInstance<com.google.ai.edge.litertlm.Content.Text>()
             .joinToString("") { it.text }
+
+        if (firstTokenTime == 0L && chunk.isNotEmpty()) {
+            firstTokenTime = System.nanoTime()
+        }
+        if (chunk.isNotEmpty()) {
+            tokenCount++
+        }
 
         onToken(chunk, false)
 
@@ -60,12 +79,27 @@ internal class StreamingCallbackListener(
         onToken("", true)
         val fullResponse = responseBuilder.toString()
         history.add(Message(Role.MODEL, fullResponse))
-        Log.d("StreamingCallbackListener", "Streaming done. Length: ${fullResponse.length}")
+
+        // Compute stats using heuristic token counts (~4 chars/token)
+        val elapsedMs = (System.nanoTime() - startTime) / 1_000_000.0
+        val ttftMs = if (firstTokenTime > 0) (firstTokenTime - startTime) / 1_000_000.0 else 0.0
+        val promptTokens = userMessage.length / 4.0
+        val completionTokens = fullResponse.length / 4.0
+        onStatsReady(GenerationStats(
+            promptTokens = promptTokens,
+            completionTokens = completionTokens,
+            totalTokens = promptTokens + completionTokens,
+            timeToFirstToken = ttftMs,
+            totalTime = elapsedMs,
+            tokensPerSecond = if (elapsedMs > 0) completionTokens / (elapsedMs / 1000.0) else 0.0
+        ))
+
+        Log.d("StreamingCallbackListener", "Streaming done. Length: ${fullResponse.length}, TTFT: ${ttftMs.toLong()}ms, Total: ${elapsedMs.toLong()}ms")
     }
 
-    override fun onError(t: Throwable) {
-        Log.e("StreamingCallbackListener", "Async generation failed", t)
-        onToken("Error: ${t.message}", true)
+    override fun onError(throwable: Throwable) {
+        Log.e("StreamingCallbackListener", "Async generation failed", throwable)
+        onToken("Error: ${throwable.message}", true)
     }
 }
 
@@ -80,6 +114,10 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
     companion object {
         private const val TAG = "HybridLiteRTLM"
         private val initLock = Any()
+
+        /** Cached result of OpenCL availability probe (null = not yet checked). */
+        @Volatile
+        private var openCLAvailable: Boolean? = null
         
         /**
          * Initialize the native library.
@@ -161,6 +199,35 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                 }
     
                 try {
+                    // Early GPU hardware check: probe for OpenCL library before
+                    // spending time on engine creation. LiteRT-LM's GPU delegate
+                    // requires OpenCL, which is absent on most Samsung/Qualcomm devices.
+                    if (backend == Backend.GPU) {
+                        val hasOpenCL = openCLAvailable ?: run {
+                            val result = try {
+                                System.loadLibrary("OpenCL")
+                                true
+                            } catch (_: UnsatisfiedLinkError) {
+                                try {
+                                    // Some devices have it at a non-standard path
+                                    System.load("/system/vendor/lib64/libOpenCL.so")
+                                    true
+                                } catch (_: UnsatisfiedLinkError) {
+                                    false
+                                }
+                            }
+                            openCLAvailable = result
+                            result
+                        }
+                        if (!hasOpenCL) {
+                            throw RuntimeException(
+                                "GPU backend is not supported on this device (OpenCL library not found). " +
+                                "Please use CPU backend instead."
+                            )
+                        }
+                        Log.i(TAG, "OpenCL library found — GPU backend is available")
+                    }
+
                     // Map our Backend enum to LiteRT-LM Backend sealed class
                     val lmBackend = when (backend) {
                         Backend.GPU -> com.google.ai.edge.litertlm.Backend.GPU()
@@ -215,9 +282,15 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                     // Create Conversation
                     createNewConversation()
                     Log.i(TAG, "Conversation created successfully")
+
+                    // Validate the engine actually works with a quick test inference.
+                    // GPU backend can initialize without error but silently fail to produce tokens.
+                    validateEngine()
     
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to load model: ${e.message}", e)
+                    // Clean up partial state so isReady() returns false
+                    cleanupInternal()
                     throw RuntimeException("Failed to load model: ${e.message}", e)
                 }
             }
@@ -241,7 +314,7 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
             Log.i(TAG, "sendMessage (Promise): $message")
             
             // Blocking inference (safe here because we are in Promise.parallel worker thread)
-            val userMsg = LiteRTMessage.of(text = message)
+            val userMsg = LiteRTMessage.user(message)
             val startTime = System.nanoTime()
             val responseMsg = conversation!!.sendMessage(message = userMsg)
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000.0
@@ -292,10 +365,12 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
             onToken = onToken,
             responseBuilder = fullResponseBuilder,
             history = history,
+            userMessage = message,
+            onStatsReady = { stats -> lastStats = stats },
         )
 
         try {
-            val userMsg = LiteRTMessage.of(text = message)
+            val userMsg = LiteRTMessage.user(message)
             conversation!!.sendMessageAsync(message = userMsg, callback = listener)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initiate async generation", e)
@@ -359,7 +434,7 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
             // Use factory method Message.of passing a list of Content
             val textContent = Content.Text(message)
             
-            val userMsg = LiteRTMessage.of(textContent, Content.ImageFile(processedImagePath))
+            val userMsg = LiteRTMessage.user(Contents.of(textContent, Content.ImageFile(processedImagePath)))
 
             // Add to history
             history.add(Message(Role.USER, "$message [Image]"))
@@ -501,10 +576,10 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
 
             // Load audio
             
-            val userMsg = LiteRTMessage.of(
+            val userMsg = LiteRTMessage.user(Contents.of(
                 Content.Text(message),
                 Content.AudioFile(audioPath)
-            )
+            ))
 
             history.add(Message(Role.USER, "$message [Audio]"))
             
@@ -641,7 +716,16 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
             }
             conversation = null
         }
-        conversation = engine!!.createConversation()
+        // Create conversation with explicit SamplerConfig (required by Gallery pattern).
+        // GPU backend may fail silently without proper sampler params.
+        val convConfig = ConversationConfig(
+            samplerConfig = SamplerConfig(
+                topK = topK,
+                topP = topP,
+                temperature = temperature,
+            )
+        )
+        conversation = engine!!.createConversation(convConfig)
         // Apply system prompt/instruction if set
         systemPrompt?.let { prompt ->
             if (prompt.isNotEmpty()) {
@@ -649,7 +733,7 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                     // Send system instruction as the first turn to prime the conversation.
                     // LiteRT-LM's Conversation API handles chat template formatting,
                     // including Gemma's <start_of_turn>system block.
-                    val systemMsg = LiteRTMessage.of(Content.Text(prompt))
+                    val systemMsg = LiteRTMessage.system(prompt)
                     conversation!!.sendMessage(message = systemMsg)
                     Log.i(TAG, "System prompt applied (${prompt.length} chars)")
                 } catch (e: Exception) {
@@ -657,6 +741,78 @@ class HybridLiteRTLM : HybridLiteRTLMSpec() {
                 }
             }
         }
+    }
+
+    /**
+     * Validate that the engine can actually produce inference output.
+     *
+     * Some GPU backends initialize without error but silently hang during inference.
+     * This sends a minimal test prompt ("Hi") and waits up to 30s for any token.
+     * If no token arrives, we throw so the model does NOT appear as loaded.
+     */
+    private fun validateEngine() {
+        val backendName = when (backend) {
+            Backend.GPU -> "GPU"
+            Backend.NPU -> "NPU"
+            else -> "CPU"
+        }
+        Log.i(TAG, "Validating $backendName backend with test inference...")
+
+        val latch = CountDownLatch(1)
+        val gotToken = AtomicBoolean(false)
+        val errorRef = AtomicReference<String?>(null)
+
+        // Use the existing conversation for validation (single-session constraint).
+        val validationConv = conversation
+            ?: throw RuntimeException("$backendName backend: no conversation available for validation")
+
+        try {
+            val testMsg = LiteRTMessage.user("Hi")
+            validationConv.sendMessageAsync(
+                message = testMsg,
+                callback = object : com.google.ai.edge.litertlm.MessageCallback {
+                    override fun onMessage(msg: com.google.ai.edge.litertlm.Message) {
+                        gotToken.set(true)
+                        latch.countDown()
+                    }
+                    override fun onDone() {
+                        latch.countDown()
+                    }
+                    override fun onError(t: Throwable) {
+                        errorRef.set(t.message)
+                        latch.countDown()
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            throw RuntimeException(
+                "$backendName backend failed to run inference: ${e.message}. " +
+                "This device may not support the $backendName backend. Please try CPU.",
+                e
+            )
+        }
+
+        // Wait up to 30s for any response
+        val completed = latch.await(30, TimeUnit.SECONDS)
+
+        val error = errorRef.get()
+        if (error != null) {
+            throw RuntimeException(
+                "$backendName backend inference error: $error. " +
+                "This device may not support the $backendName backend. Please try CPU."
+            )
+        }
+        if (!completed || !gotToken.get()) {
+            throw RuntimeException(
+                "$backendName backend produced no response within 30 seconds. " +
+                "This device may not support the $backendName backend. Please try CPU."
+            )
+        }
+
+        Log.i(TAG, "$backendName backend validated successfully")
+
+        // Re-create the real conversation (validation consumed one turn)
+        createNewConversation()
     }
 
 
